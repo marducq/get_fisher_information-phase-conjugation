@@ -4,6 +4,9 @@ from matplotlib.colors import LogNorm
 from scipy import special
 import random
 
+from fisher_functions import get_W3
+import copy
+import torch
 random.seed(42)
 
 class DipoleSimulation:
@@ -18,7 +21,7 @@ class DipoleSimulation:
         self.pas_x = L / N_x
         self.pas_y = W / N_y
         self.ksi = L / N_y
-        
+        self.Nb_input_modes = 30
         # Génère la configuration initiale des dipôles
         self.X_random, self.Y_random = self.creation_grille_avec_points_aleat()
         # Construit la matrice d'interaction A entre dipôles
@@ -117,6 +120,39 @@ class DipoleSimulation:
         if update_matrix:
             self.A = self.compute_interaction_matrix()
 
+    
+    def deplacement_particules_random(self, n=10 , update_matrix=True):
+        
+        #Déplace aléatoirement n particules de la configuration actuelle
+        #d'une distance self.ksi en Y sur la grille.
+
+        #Paramètres :
+        #- n : int, nombre de particules à déplacer.
+        #- update_matrix : bool, si True (par défaut), met à jour la matrice d'interaction après déplacement.
+
+        #Exemple :
+        
+        # Déplacer aléatoirement 5 particules de self.ksi en Y
+        #sim.deplacement_particules_random(5)
+        
+        
+        if not isinstance(n, int) or n < 1:
+            raise ValueError("Le nombre de particules à déplacer doit être un entier positif")
+        if n > self.Nb_particule:
+            raise ValueError("n ne peut pas dépasser le nombre total de particules")
+
+        # Sélection aléatoire d'indices uniques
+        indices = np.random.choice(self.Nb_particule, size=n, replace=False)
+
+        # Appliquer le déplacement standard self.ksi à chaque particule sélectionnée
+        for idx in indices:
+            self.Y_random[idx] += self.ksi
+
+        # Mettre à jour la matrice d'interaction si demandé
+        if update_matrix:
+            self.A = self.compute_interaction_matrix()
+
+    
 
 
 
@@ -166,6 +202,181 @@ class DipoleSimulation:
         
         diff = np.linalg.norm(I_mod - I_ref)
         return diff
+    
+    def compute_input_field_particlebasis(self, input_field, theta_vals):
+        
+        #Transforme un vecteur d'entrée optimisé Xopt, défini dans un espace réduit de dimension
+        #Nb_input_modes, en un vecteur d'entrée complet de dimension self.Nb_particule, en supposant que 
+        #chaque composante de Xopt correspond à une onde plane incidente depuis un angle donné (dans theta_vals).
+
+        #Paramètres:
+        #  Xopt       : Vecteur optimisé (dimension Nb_input_modes).
+        # theta_vals : Tableau des angles associés aux modes (taille Nb_input_modes).
+
+        #Retourne:
+        #  input_field_full : Vecteur d'entrée complet qui correspond au champ incident percu par chacune des particules ( cest E_0( r_j) du TD ) (dimension self.Nb_particule).
+        
+        E0 = np.zeros(self.Nb_particule, dtype=complex)
+        for j in range(self.Nb_particule):
+            x_j = self.X_random[j]
+            y_j = self.Y_random[j]
+            inc = 0.0 + 0.0j
+            for n in range(len(theta_vals)):
+                # Superposition pondérée d'ondes planes pour créer le champ incident en (x_j, y_j)
+                inc += input_field[n] * np.exp(1j * self.k_in * (np.cos(theta_vals[n]) * x_j + np.sin(theta_vals[n]) * y_j))
+            E0[j] = inc
+        return E0
+        
+
+
+    def compute_field_with_input(self, theta_vals, N_obs_x, N_obs_y, input_field):
+        """
+        Calcule le champ total E_total sur la grille d'observation en utilisant
+        un vecteur d'entrée custom (input_field) pour exciter les dipôles.
+
+        Paramètres :
+        theta_vals  : Angles d'incidence (radians).
+        N_obs_x     : Nombre de points dans la grille d'observation en x.
+        N_obs_y     : Nombre de points dans la grille d'observation en y.
+        input_field : Vecteur d'entrée imposé sur les dipôles (dimension = Nb_input_modes).
+
+        Retourne :
+        x_obs       : Grille en x (1D).
+        y_obs       : Grille en y (1D).
+        E_total     : Champ total complexe (2D de dimensions (N_obs_y, N_obs_x)).
+        """
+        # On utilise directement le vecteur input_field pour exciter les dipôles.
+        E0 = self.compute_input_field_particlebasis(input_field, theta_vals)  # Dimension attendue : (self.Nb_particule,)
+       
+
+        # Résolution du système linéaire (I - A)E = E0 afin d'obtenir la réponse des dipôles E.
+        I_mat = np.eye(self.Nb_particule, dtype=complex)
+        M = I_mat - self.A
+        E = np.linalg.solve(M, E0)
+
+        # Définition de la grille d'observation
+        x_obs = np.linspace(-self.L, 2 * self.L, N_obs_x)
+        y_obs = np.linspace(-self.L, self.W + self.L, N_obs_y)
+        X_obs, Y_obs = np.meshgrid(x_obs, y_obs)
+
+        # Initialisation du champ total sur la grille
+        E_total = np.zeros_like(X_obs, dtype=complex)
+        for i in range(N_obs_y):
+            for j in range(N_obs_x):
+                # Coordonnées d'observation
+                r_obs = (X_obs[i, j], Y_obs[i, j])
+                contributio = 0.0 + 0.0j
+
+                # Champ incident en ce point
+                if len(input_field) != len(theta_vals):
+                    raise ValueError("Mismatch between input_field length and theta_vals length.")
+                for n in range(len(theta_vals)):
+                    contributio += input_field[n] * np.exp(
+                        1j * self.k_in * (np.cos(theta_vals[n]) * r_obs[0] + np.sin(theta_vals[n]) * r_obs[1])
+                    )
+
+                E0_r = contributio
+
+                # Contribution de chaque dipôle via la fonction de Green
+                somme = 0.0 + 0.0j
+                for idx in range(self.Nb_particule):
+                    r_part = (self.X_random[idx], self.Y_random[idx])
+                    somme += self.green_function(r_obs, r_part, self.k_in) * E[idx]
+
+                # Composition du champ total (champ incident + contribution des dipôles)
+                E_total[i, j] = E0_r + self.k_in**2 * self.alpha * somme
+
+        return x_obs, y_obs, E_total
+
+
+    def compute_Q(self, theta_vals, N_obs_x, N_obs_y, particle_index=50, ksi_calib=None):
+        
+        TM_ref, TM_calib = self.compute_TMs_pair(theta_vals, N_obs_x, N_obs_y,
+                                                 particle_index=particle_index,
+                                                 ksi_calib=ksi_calib)
+        # dH : différence finie entre la TM calibrée et la TM de référence
+        dH = (TM_calib - TM_ref) / (ksi_calib if ksi_calib is not None else self.L/self.N_y)
+        Q = np.conjugate(dH).T @ dH
+        return TM_ref , TM_calib, Q
+
+    def compute_TMs_pair(self, theta_vals, N_obs_x, N_obs_y, particle_index=50, ksi_calib=None):
+    
+        # Si aucun déplacement n'est fourni, on le définit par défaut
+        if ksi_calib is None:
+            ksi_calib = self.L / self.N_y
+
+        # Calcul de la TM de référence :
+        # La méthode build_TM boucle sur theta_vals et renvoie un tableau de forme (Nb_input_modes, N_obs_y).
+        TM_ref_all = self.build_TM_surdetecteur( theta_vals, N_obs_x , N_obs_y=300 , particle_index = 50 , ksi_calib = None)
+        # Transposer pour obtenir une TM de forme (Nb_output_modes, Nb_input_modes)
+        TM_ref = TM_ref_all.T
+
+        # Calcul de la TM de calibration :
+        sim_calib = copy.deepcopy(self)
+
+        # si on veut déplacer une particule à la fois
+        #sim_calib.deplacement_particule(index=particle_index, ksi=ksi_calib)
+
+
+        # si on veut déplacer plusieurs particules à la fois 
+        sim_calib.deplacement_particules_random(n=10, update_matrix=True)
+
+
+        TM_calib_all = sim_calib.build_TM_surdetecteur(theta_vals, N_obs_x , N_obs_y=300 , particle_index = 50 , ksi_calib = None)
+        TM_calib = TM_calib_all.T
+
+        return TM_ref, TM_calib
+
+    def build_TM_surdetecteur(self, theta_vals, N_obs_x , N_obs_y=300 , particle_index = 50 , ksi_calib = None):
+        """
+        Pour chaque angle de theta_vals, calcule le champ total au détecteur
+        situé à x = 1.5 pour y ∈ [1, 2] en N_obs_y points.
+        Renvoie un tableau de forme (len(theta_vals), N_obs_y).
+        """
+        x_det = 1.5
+        y_min, y_max = 1.0, 2.0
+
+        # grille du détecteur en y
+        y_obs = np.linspace(y_min, y_max, N_obs_y)
+
+        TM_pretransposee = []
+
+        # matrice I - A (constante si la configuration de dipôles ne change pas)
+        M = np.eye(self.Nb_particule, dtype=complex) - self.A
+
+        for idx, th in enumerate(theta_vals):
+            print(f"Traitement de theta {idx+1}/{len(theta_vals)}")
+
+            # 1) Calcul du champ incident sur chaque dipôle et résolution de (I-A)E = E0
+            E0 = np.array([self.champ_incident(xj, yj, th)
+                        for xj, yj in zip(self.X_random, self.Y_random)])
+            E = np.linalg.solve(M, E0)
+
+            # 2) Calcul du champ sur le détecteur
+            field_line = np.zeros(N_obs_y, dtype=complex)
+            for i, y in enumerate(y_obs):
+                r_obs = (x_det, y)
+                # champ incident au détecteur
+                E0_r = self.champ_incident(x_det, y, th)
+                # contribution des dipôles
+                somme = 0+0j
+                for j in range(self.Nb_particule):
+                    r_part = (self.X_random[j], self.Y_random[j])
+                    somme += self.green_function(r_obs, r_part, self.k_in) * E[j]
+                # champ total
+                field_line[i] = E0_r + (self.k_in**2 * self.alpha) * somme
+
+            TM_pretransposee.append(field_line)
+
+        # résultat de forme (N_input, N_obs_y)
+        return np.array(TM_pretransposee)
+
+
+        
+
+
+
+
 
 
 
@@ -178,7 +389,7 @@ class PhaseConjugation:
         self.TM_dagger = TM_pretransposee.conj()  # forme (N_obs_y, N_input)
         # Pour la propagation, nous définissons la TM dans la convention (N_obs_y, N_input)
         self.TM = TM_pretransposee.T
-        print("TM shape est" , self.TM.shape)
+        print("TM shape = " , self.TM.shape)
 
     def compute_input_field(self, desired_output):
         
@@ -191,5 +402,24 @@ class PhaseConjugation:
     def compute_focused_output(self, phase_input):
         
         return np.dot(self.TM, phase_input)
+    
+
+    def phaseconj_ampl_phase(self, desired_output, normalize=True):
+        """
+        Calcule la solution amplitude+phase x_ls = H^+ · desired_output,
+        avec H^+ la pseudo‑inverse de H.
+
+        Si normalize=True, on renormalise ||x_ls||₂ = 1 pour conserver 
+        la même « puissance totale ».
+        """
+        # 1) pseudo‑inverse de H
+        H = self.TM                  # shape (N_output, N_input)
+        x_ls = np.linalg.pinv(H) @ desired_output
+
+        # 2) normalisation L2 optionnelle
+        if normalize:
+            x_ls = x_ls / np.linalg.norm(x_ls)
+
+        return x_ls
 
 
